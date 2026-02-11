@@ -1,13 +1,29 @@
 import argparse
 import cv2
 import glob
-import matplotlib
 import numpy as np
 import os
+import sys
 import torch
+import matplotlib
+import OpenEXR
+import Imath
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from depth_anything_v2.dpt import DepthAnythingV2
 
+
+def save_exr(filename, depth):
+    h, w = depth.shape
+    header = OpenEXR.Header(w, h)
+    header['channels'] = {
+        'Z': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+    }
+
+    exr = OpenEXR.OutputFile(filename, header)
+    exr.writePixels({'Z': depth.tobytes()})
+    exr.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Depth Anything V2')
@@ -20,10 +36,12 @@ if __name__ == '__main__':
     
     parser.add_argument('--pred-only', dest='pred_only', action='store_true', help='only display the prediction')
     parser.add_argument('--grayscale', dest='grayscale', action='store_true', help='do not apply colorful palette')
+    parser.add_argument('--exr', dest='exr', action='store_true', help='save float32 EXR')
     
     args = parser.parse_args()
     
     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    print('Using device:', DEVICE)
     
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -31,12 +49,30 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-
-    cache_path = os.path.expanduser('~/.cache/depth-anything-v2/')
-    abs_cache_path = os.path.abspath(cache_path)
-
+    
     depth_anything = DepthAnythingV2(**model_configs[args.encoder])
-    depth_anything.load_state_dict(torch.load(f'{abs_cache_path}/depth_anything_v2_{args.encoder}.pth', map_location='cpu'))
+    
+    # Load from GitHub releases (no auth required)
+    import urllib.request
+    
+    model_urls = {
+        'vits': 'https://huggingface.co/lieryan/Depth-Anything-V2-Small/resolve/main/pytorch_model.bin',
+        'vitb': 'https://huggingface.co/lieryan/Depth-Anything-V2-Base/resolve/main/pytorch_model.bin',
+        'vitl': 'https://huggingface.co/lieryan/Depth-Anything-V2-Large/resolve/main/pytorch_model.bin',
+        'vitg': 'https://huggingface.co/lieryan/Depth-Anything-V2-Giant/resolve/main/pytorch_model.bin'
+    }
+    
+    cache_dir = os.path.expanduser('~/.cache/depth-anything-v2')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(cache_dir, f'depth_anything_v2_{args.encoder}.pth')
+    
+    if not os.path.exists(checkpoint_path):
+        print(f'Downloading {args.encoder} model... (~1-3 GB, may take a few minutes)')
+        urllib.request.urlretrieve(model_urls[args.encoder], checkpoint_path)
+        print('Download complete.')
+    
+    depth_anything.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
     depth_anything = depth_anything.to(DEVICE).eval()
     
     if os.path.isfile(args.img_path):
@@ -59,9 +95,13 @@ if __name__ == '__main__':
         
         depth = depth_anything.infer_image(raw_image, args.input_size)
         
+        if args.exr:
+            save_exr(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.exr'), depth)
+            exit(0)
+        
         depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
         depth = depth.astype(np.uint8)
-
+        
         if args.grayscale:
             depth = np.repeat(depth[..., np.newaxis], 3, axis=-1)
         else:
@@ -73,4 +113,4 @@ if __name__ == '__main__':
             split_region = np.ones((raw_image.shape[0], 50, 3), dtype=np.uint8) * 255
             combined_result = cv2.hconcat([raw_image, split_region, depth])
             
-            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] +'.sbs.png'), combined_result)
+            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.png'), combined_result)
